@@ -1,0 +1,574 @@
+
+/** CLASS Amp_12																					run 9-Jul-2021
+	* Scans grey level ImageSequence frames to find edges then areas of a dark object, e.g. ampullae, which changes size.
+	* The object is defined by a black mask in first frame; edge of mask should approximate position of objects edge.
+	* In scanning x,y are generalized to xScanLine[Li][Pi], yScan ... arrays supplied by Class ScanLines. Separation of
+	* definition of ScanLines from actual x, y scanning make it easier to scan in horizontal, vertical, and diagonal directions.
+	* If object is elongated, best to scan perpendicular to object axis.
+	* Edges found by short scans 2 x SCAN_MARGIN pixels long, centered at mask edge, from out to inside object. 
+	* Edge defined as 1st pixel < EDGE_TH - (GL at start of scan)
+	* Diagnostic graphic for each each frame: Start & stop scan points -> black, white; edge -> black;
+	* Basic algorithm from Amp_09, but some array names and types from Amp_10 (which corrects edges that deviate from median).
+	* @author mwkonrad
+	* @version 20-Oct-2020
+	*/ 
+	//import ij.*;
+	import ij.process.*;
+	import ij.gui.*;
+	import ij.plugin.filter.*;
+	import ij.ImagePlus;
+	//import ij.text.*;
+	import java.io.*;
+	//import java.lang.reflect.Array;
+	import java.text.DateFormat;
+	import java.text.SimpleDateFormat;
+	import java.util.*;
+	//import java.awt.*;
+	// =============================================================	CREATE my ImagePlus instance
+	public class Amp_12 implements PlugInFilter {
+		ImagePlus imp;
+		@Override
+		public int setup(String arg, ImagePlus imp) {
+			this.imp = imp;
+			return DOES_ALL+DOES_STACKS+SUPPORTS_MASKING;
+		}
+		// variables used in all frames must be declared outside the run(ImageProcessor) loop
+		public static int iImage = 0;						// frame index
+		// my variables
+		//private int imageSize;
+		private int jImage,jFrame;							// my copy of iImage, group frame index
+		private int thisPixel;								// pixel intensity
+		// variables used in the scan process
+		private int SCAN_MODE;								// pattern of x,y values supplied by Class ScanLines
+		private int SCAN_MARGIN;							// search for ampullae edge at mask edge +/- SCAN_MARGIN
+		private int nSL;									// number of scan lines
+		private int nSLPixels [] = new int[3000];			// number of pixels in each scan line; for 640x480 FOV
+		private int xSLPixels [][] = new int [3000][2000];	// x along a ScanLine[ScanLine][Position]
+		private int ySLPixels [][] = new int [3000][2000];	// y value ...
+		private int nP, xP, yP;								// number of pixels in a line; x,y values of pixel
+		private int iSL, jP;								// Scan Line index, pixel index along Scan Line
+		private boolean moveF, moveR;						// move forward along scan line, .. reverse
+		// mask variables
+		private int iMaskSL, nMaskSL;
+		private int maskSL [] = new int [1000];				// list of mask ScanLine indexes
+		private int maskP1 [] = new int [1000];				// list of mask 1st Pixel indexes (on above ScanLines)
+		private int maskP2 [] = new int [1000];				// list of mask 2nd Pixel indexes
+		private int mSL, mP1, mP2;							// temp values of maskSL, maskP1, maskP2
+		private int markP1, markP2;							// Ps for marks just outside scanning segments
+		private int scanMarginGap = 4;						// mark every Nth pixel on scan margin lines
+		private int sP1, sP2;
+		// cumulative amp scan results (int) saved in SCAN AMP section
+		private int iGroup = 0;								// index of a Group of frames
+		private int nGroup;									// number of frames in a Group, set by Dialog
+		private int cAmpP1 [] = new int [1000];				// cum (group) sum of AMP P1 [iSL]
+		private int cAmpP2 [] = new int [1000];				//					... P2
+		// actual amp values (float) generated in FRAME GROUP section
+		private float aAmpP1 [] = new float [1000]; 		// average (group) AMP P1 [iSL]
+		private float aAmpP2 [] = new float [1000];			//					... P2 []
+		private float rawAmpPP;								// a chord
+		private float rawAmpArea [] = new float [10000];
+		// Amp segment Pixel areas
+		private int iAmpSeg;								// segment index
+		private int nAmpSeg = 4;							// number of segments in Ampullae
+		private int nSLperSeg;								// number of ScanLines per segment
+		private float rawSegArea[][] = new float [4][10000];		// pixels in [segment][group]
+		// debug variables, Grey Levels, ...
+		private float dbfVar;
+		private int dbk;
+		private int dbOut [] = new int [12000];
+		private boolean myDebug = true;						// enables debug section
+		private int EDGE_TH;								// GL increment over background that defines amp edge
+		private int aThresh;								// gray level above bkgd; defines edge of ampullae
+		private int bkgdGL;									// back ground gray level;
+		private int mThresh = 128;							// threshold for mask; 128 = middle of back & white
+		private int blackGL = 0;
+		private int whiteGL = 255;
+		// -----------------------------------------------------------------------		Dialog & derived variables
+		private double OBJECTIVE;			// objective lens as a decimal, e.g. 0.5, 1.0, 2.0
+		private double ZOOM;				// zoom setting as a decimal, e.g. 4.0
+		private double px2mm;				// multiplier, number pixels to number mm
+		private double spx2smm;				// multiplier, snumber square pixels to number square mm
+		private double hFOV = 9.0;			// horizontal field of view in mm at o1 z1
+		//private int xcBand;
+		private int printAt;
+		
+	// ip called repeatedly to process all images in stack	========================================================== ip loop
+		@Override
+			public void run(ImageProcessor ip) {
+			int w = ip.getWidth();
+			int h = ip.getHeight();
+			//imageSize = w * h;
+			jImage = iImage;										// jImage just my copy of iImage (convenient for debugging)
+	// ====================================================== iImage = 0, get DIALOG parameters, scan mask, create mask arrays
+			if(jImage == 0) {
+				GenericDialog gd = new GenericDialog("Amp-11");
+				
+				final String[] scanMode = new String[] {"horizontal","vertical","down diag","up diag"};
+				
+				gd.addChoice("scan direction",scanMode,scanMode[SCAN_MODE]);
+				gd.addNumericField("Scan margin", 8, 0);
+				gd.addNumericField("Edge threashold", 20, 0);
+				//gd.addNumericField("Allow edge->median", 1.0, 1);
+				gd.addNumericField("Group size", 30, 0);
+				gd.addNumericField("Objective", 1.0, 1);
+				gd.addNumericField("Zoom", 4.00, 2);
+				gd.addNumericField("Print at frame: ", 60, 0);
+				gd.showDialog();
+				if (gd.wasCanceled()) return;
+				
+				SCAN_MODE = (int) gd.getNextChoiceIndex();
+				SCAN_MARGIN = (int) gd.getNextNumber();
+				EDGE_TH = (int) gd.getNextNumber();
+				//OK_PD = gd.getNextNumber();
+				nGroup = (int) gd.getNextNumber();
+				OBJECTIVE = gd.getNextNumber();
+				ZOOM = gd.getNextNumber();
+				printAt = (int) gd.getNextNumber();
+				px2mm = hFOV / (OBJECTIVE * ZOOM * w);					// get factor to convert pixels to mm
+				spx2smm = px2mm * px2mm;
+				
+				ScanLines myScanLines = new ScanLines (w, h, SCAN_MODE);// ------------------------- get x,y values of ScanLines
+				nSL = myScanLines.nLines();								// number of scan lines
+				nSLPixels = myScanLines.nPixels();						// number of x,y in each scan line
+				xSLPixels = myScanLines.xPixels();						// x values in each scan line
+				ySLPixels = myScanLines.yPixels();						// y values in each scan line
+				// =========================== copy initial segments of xSLPixels[][] to 1D array for easy reading in Eclipse debug mode
+				if (myDebug) {						// dbOut[] intended to be read in debug mode,
+					dbk = 0;						// repeating groups of 5 numbers: (scanLine index, 1st 4 X values, 1st 4 Y values), ...
+					for (int i = 0; i < nSL; i++) {
+						dbOut[dbk] = i;
+						dbk++;
+						for (int j = 0; j < 4; j++) {
+							dbOut[dbk] = xSLPixels[i][j];
+							dbk++;
+						}
+						for (int j = 0; j < 4; j++) {
+							dbOut[dbk] = ySLPixels[i][j];
+							dbk++;
+						}
+					}
+				}
+				// ====================================================================================	FIND mask edges
+				// each edge found scanning from out inward, thus mask interior not important  
+				iMaskSL = 0;
+				for (iSL = 0; iSL < nSL; iSL++) {				// for each ScanLine
+					moveF = true;								// initialize direction commands
+					moveR = true;
+					nP = nSLPixels[iSL];						// number of pixels in this scan line
+					
+					for (jP = 0; jP < nP; jP++) {				// move FORWARD along this ScanLine
+						if (moveF) {
+							xP = xSLPixels[iSL][jP];			// 3 lines of code required to get Grey Level
+							yP = ySLPixels[iSL][jP];
+							thisPixel = ip.getPixel(xP, yP);
+							if(thisPixel < mThresh) {			// found first edge of MASK
+								moveF = false;					// thus finished FORWARD scan
+								
+								maskSL [iMaskSL] = iSL;			// store mask ScanLine index
+								maskP1 [iMaskSL] = jP;			// store mask 1st edge pixel index
+							}
+						}
+					}
+					for (jP = nP; jP >= 0; jP--) {				// move in RVERSE on same ScanLine
+						if (moveR) {
+							xP = xSLPixels[iSL][jP];
+							yP = ySLPixels[iSL][jP];
+							thisPixel = ip.getPixel(xP,yP);
+							if(thisPixel < mThresh) {			// found second edge of MASK
+								moveR = false;					// thus finished RVERSE scan
+								
+								maskP2 [iMaskSL] = jP;			// store mask 2nd mask pixel index
+								iMaskSL++;						// found both edges, inc mask ScanLine index
+							}									// on exit imaskSL equals NUMBER of ScanLines in mask
+						}
+					}
+				}
+				nMaskSL = iMaskSL;								// just for consistent notation
+				iGroup = 0;										// for iImage > 0 data [iGroup] averaged over nGroup frames
+				nSLperSeg = nMaskSL / nAmpSeg;
+			} //	END jImage = 0, mask frame
+			else {	// ================================================================	iImage > 0, FIND ampullae edges 
+				for (iSL = 0; iSL < nMaskSL; iSL++) {			// for each Mask ScanLine
+					mSL = maskSL[iSL];							// for each iSL get the actual ScanLine
+											// ==========	find P of 1st AMP edge
+					mP1 = maskP1[iSL];							// CAREFUL: in mP1 the 1 -> a mask edge number
+					sP1 = mP1 - SCAN_MARGIN;					//		... in sP1 the 1 -> the start of a scan
+					sP2 = mP1 + SCAN_MARGIN;					// end at larger
+													// put marks just outside start & end of 1st row of scan segments
+					if (iSL % scanMarginGap == 0) {				// every scanMarginGap put marks
+						markP1 = sP1 - 1;						// ...just before scanned segment -> black
+						xP = xSLPixels[mSL][markP1];
+						yP = ySLPixels[mSL][markP1];
+						ip.putPixel(xP, yP, blackGL);
+						markP2 = sP2 + 1;						// ...just after scanned segment -> white
+						xP = xSLPixels[mSL][markP2];
+						yP = ySLPixels[mSL][markP2];
+						ip.putPixel(xP, yP, whiteGL);
+					}
+													// scan 1st row of scan segments to find amp edge
+					xP = xSLPixels[mSL][sP1];					// start of scan: get threshold
+					yP = ySLPixels[mSL][sP1];
+					bkgdGL = ip.getPixel(xP,yP);				// background = GL at start
+					aThresh = bkgdGL - EDGE_TH;					// threshold less since amp is darker
+					moveF = true;								// initialize direction commands
+					for (jP = sP1; jP <= sP2; jP++) {			// move FORWARD between sP1 and sP2
+						if (moveF) {							// if amp edge hasn't been found yet
+							xP = xSLPixels[mSL][jP];
+							yP = ySLPixels[mSL][jP];
+							thisPixel = ip.getPixel(xP, yP);
+							if(thisPixel < aThresh) {			// FOUND edge (darker than threshold)
+								moveF = false;					// finished FORWARD scan
+								cAmpP1 [iSL] += jP;				// SAVE in cumulative (group) edge Ps
+								ip.putPixel(xP, yP, blackGL);	// put black mark at AMPULLAE edge
+							}
+						}
+					}
+					if (moveF) {								// MISSED EDGE
+						cAmpP1 [iSL] += mP1;					// use MASK edge in cumulative (group) edge Ps
+						xP = xSLPixels[mSL][mP1];				
+						yP = ySLPixels[mSL][mP1];		
+						ip.putPixel(xP,yP,blackGL);				// & black mark at MASK edge
+					}
+											// ==========	find P of 2nd AMP edge
+					mP2 = maskP2[iSL];				
+					sP1 = mP2 + SCAN_MARGIN;					// now start scan at larger P value
+					sP2 = mP2 - SCAN_MARGIN;					// end at smaller
+													// put marks just outside start & end of 2st row of scan segments
+					if (iSL % scanMarginGap == 0) {				// every scanMarginGap put marks
+						markP1 = sP1 + 1;						// ...before scanned segment -> black
+						xP = xSLPixels[mSL][markP1];
+						yP = ySLPixels[mSL][markP1];
+						ip.putPixel(xP, yP, blackGL);
+						markP2 = sP2 - 1;						// ...after scanned segment -> white
+						xP = xSLPixels[mSL][markP2];
+						yP = ySLPixels[mSL][markP2];
+						ip.putPixel(xP, yP, whiteGL);
+					}
+													// scan 2st row of scan segments to find amp edge
+					xP = xSLPixels[mSL][sP1];					// start of scan: get threshold
+					yP = ySLPixels[mSL][sP1];
+					bkgdGL = ip.getPixel(xP,yP);				// background = GL at start
+					aThresh = bkgdGL - EDGE_TH;					// amp will be darker: < bdgdGL
+					moveR = true;
+					for (jP = sP1; jP >= sP2; jP--) {		// move in RVERSE on same ScanLine	
+						if (moveR) {							// if amp edge hasn't been found
+							xP = xSLPixels[mSL][jP];
+							yP = ySLPixels[mSL][jP];
+							thisPixel = ip.getPixel(xP,yP);
+							if(thisPixel < aThresh) {			// FOUND 2nd edge of AMP
+								moveR = false;					// thus finished RVERSE scan
+								cAmpP2 [iSL] += jP;				// SAVE in cumulative (group) edge Ps
+								ip.putPixel(xP, yP, blackGL);	// put black mark at AMPULLAE edge
+								
+							}
+						}
+					}
+					if (moveR) {								// MISSED edge
+						cAmpP2 [iSL] += mP2;					// use MASK edge in cumulative (group) edge Ps
+						xP = xSLPixels[mSL][mP2];
+						yP = ySLPixels[mSL][mP2];
+						ip.putPixel(xP,yP,blackGL);				// & black mark at MASK edge
+					}
+				}
+							
+				jFrame++;										// index of frame in this group
+		// ========================================================================	end of frame group, generate amp averages
+				if (jFrame == nGroup) {							// generate avg amp Ps from cum Ps
+					//ip.setFont("SansSerif", 16);
+					String sGroupNo = Integer.toString (iGroup);
+					ip.drawString("Output(sec):  " + sGroupNo, 20, 20);
+					
+					nSLperSeg = (nMaskSL + nAmpSeg) / nAmpSeg;
+					
+					for (int iSL = 0; iSL < nMaskSL; iSL++) {
+						aAmpP1 [iSL] = (float) cAmpP1 [iSL] / (float) nGroup;	// get average (group) Ps over SL
+						aAmpP2 [iSL] = (float) cAmpP2 [iSL] / (float) nGroup;
+						rawAmpPP = aAmpP2 [iSL] - aAmpP1 [iSL];					// raw (uncorrected) AMP chords
+						rawAmpArea [iGroup] += rawAmpPP;						// sum of chords = area						
+						cAmpP1 [iSL] = 0;										// zero cumulative Ps for next group
+						cAmpP2 [iSL] = 0;
+						
+						iAmpSeg = iSL / nSLperSeg;
+						rawSegArea [iAmpSeg][iGroup] += rawAmpPP;
+						
+					}
+				
+					jFrame = 0;									// Frame index in each group
+					iGroup++;									// index for next group
+				}	// END of group
+		// ============================================================================================ frame = PRINT_AT; print data
+				if (jImage == printAt) {
+					DateFormat dateFormat = new SimpleDateFormat("yyyy/MM/dd HH:mm:ss");
+					Date date = new Date();
+					try {
+						PrintWriter myWriter = new PrintWriter( new PrintStream("Ampullae areas"));	// PrintStream ("  ") is file name		
+				//		for (int i = 0; i < iGroup; i++) {									// convert pixels to sq mm
+				//			avgAmpSmm [i] = spx2smm * avgAmpP [i];
+				//			tempA [i] = avgAmpSmm [i];						// will sort tempA to find min & max values
+				//		}
+				//		tempAL = tempA.length;								// zeros in tempA are at beginning after sort()
+				//		Arrays.sort(tempA);
+				//		minArea = tempA[tempAL - iGroup];
+				//		maxArea = tempA[tempAL - 1];
+				//		mmrArea = maxArea / minArea;
+						
+						myWriter.println(dateFormat.format(date));
+						myWriter.printf ("%s\n\n", "PARAMETERS for Amp_12.java");
+						myWriter.printf("%s%6d\n", "scan mode:      ", SCAN_MODE);
+						myWriter.printf("%s%6d\n", "scan mask +/-:  ", SCAN_MARGIN);
+						myWriter.printf("%s%6d\n", "edge treshhold: ", EDGE_TH);
+						myWriter.printf("%s%6d\n", "frames averaged:", nGroup);
+				//		myWriter.printf("%s%6.3f%6.3f%6.3f\n\n","max, min, ratio: ",maxArea, minArea, mmrArea);
+						myWriter.printf("%s\n","Seconds     raw         raw segments");
+				
+						for (int i = 0; i < iGroup; i++) {
+							myWriter.printf("%5d\t%8.1f\t%8.1f\t%8.1f\t%8.1f\t%8.1f\n", i, rawAmpArea [i], rawSegArea [0][i], rawSegArea [1][i], rawSegArea [2][i], rawSegArea [3][i]);
+							
+						}
+					
+						myWriter.flush();
+						myWriter.close();
+					} // end of try
+					catch (IOException e) {
+						e.printStackTrace();
+					} // end of catch
+				} // end of if (iImage ==
+			} // end of else {
+		iImage++;
+		} // end of public void
+	} // end of public class Amp_10
+	
+	/* Class ScanLines		Supplies pixel x,y values to scan w x h field in one of 4 modes					run 6-Jul-2020
+	 * 0	h horizontal:x increments along line of constant y; horizontal, left to right
+	 * 1	v vertical: y increments along line of constant x; vertical, top to bottom
+	 * 2	dd diagonal down: both x & y increment; diagonal lines top left to bottom right
+	 * 3	du diagonal up: x increments, y decrements; diagonal lines bottom left to top right
+	 * To scan: for {each scanLine} for{pixels in scanLine; xLine[] -> x, yLine[] -> y for getPixel(x,y)
+	 * Methods return nScanLines, nPixels[] in each, xLine[ScanLine][PixelNo], yLine[ScanLine][PixelNo]
+	 * @author mwkonrad
+	 * @version 15-Aug-2020
+	*/
+	class ScanLines {
+		public int w,h;											// width, height of scanned field
+		public int smode;										// scan mode; see top comment
+		private int nPixels[] = new int[3000];					// w + h for 45 deg ScanLines; max [1920][1080]
+		private int xPixels[][] = new int[3000][2000];			// [i th line][j th value in this line]
+		private int yPixels[][] = new int[3000][2000];
+		private int nLines;										//total number of Scan Lines
+		private int iL, iP, jP, jX;								// SL index, Pixel index, value of Y, value of X
+		private int jY1;
+		private boolean startSL;								// true when valid x,y values 1st found in VSL 
+		// -----------------------------	new varibles
+		private int hm1;
+		//private int , wm1, wmh;								// h - 1, w - 1, w - h
+		private int x0;											// initial, final values of x, y
+		//private int x1, y0;
+		private int xs, ys;										// working values of x, y in scanLine generation
+										// Constructor	_______________________
+		ScanLines (int w, int h, int smode) {
+			this.w = w;
+			this.h = h;
+			this.smode = smode;
+			hm1 = h - 1;
+			//wm1 = w - 1;
+			//wmh = w - h;
+			switch (smode) {
+				case 0:	nLines = h;		// each scan line has constant Y, thus there are h = height of field
+						for (int i = 0; i < nLines; i++) {		// i th sLine
+							nPixels[i] = w;						// values in this line
+							for (int j = 0; j < w; j++) {		// 
+								xPixels[i][j] = j;
+								yPixels[i][j] = i;
+							}
+						}
+				break;
+				case 1:	nLines = w;		// each scan line has constant X, thus there are w = width of field
+						for (int i = 0; i < nLines; i++) {
+							nPixels[i] = h;
+							for (int j = 0; j < h; j++) {
+								xPixels[i][j] = i;
+								yPixels[i][j] = j;
+							}
+						}
+				break;
+				// case 2: ScanLines = diagonals directed down & to right; start at UL corner of virtual h+w FOV
+				case 2: iL = -1;							// initialize scanLine index
+				for (x0 = -hm1; x0 < w; x0++) {				// initial x values for all (virtual) SLs
+					startSL = true;
+					iP = 0;
+					
+					for (ys = 0; ys < h; ys++) {			// move down virtual SL
+						xs = x0 + ys;
+						
+						if ((xs >= 0) && (xs < w)) {		// we are in a real (valid) SL segment
+							if (startSL) {					// initialize SL if entering segment
+								iL++;
+								startSL = false;
+							}
+							nPixels[iL]++;
+							xPixels[iL][iP] = xs;
+							yPixels[iL][iP] = ys;
+							iP++;
+						}
+					}
+				}
+				nLines = iL + 1;
+				break;
+					// case 3:
+				case 3:	nLines = h + w - 1;	// ScanLines = diagonals directed up & to right; 1st at LL corner
+				jY1 = h - 1;							// jY1 = Y at bottom of FOV
+				iL = -1;								// SL index
+				for (int iX = -h; iX < w; iX++ ) {		// start X at LL end of diagonal (from -h,h -> 0,0)
+					startSL = true;						// for all VSL
+					jP = 0;								// for all VSL
+					
+					for (int jY = jY1; jY >= 0; jY--) {	// Y values on this VSL; move up on SL
+						jX = iX + (jY1 - jY);			// X values moving up this VSL
+						if ((jX >= 0) && (jX < w)) {	// we are on a valid SL segment
+							
+							if (startSL) {				// this is the 1st valid point on this SL
+								iL++;					// so increment iL from start of -1
+								startSL = false;		// can be 1st only once on this SL
+							}
+							nPixels[iL]++;				// one more Pixel on this VSL
+							xPixels[iL][jP] = jX;		// save X,Y in proper Pixels[][]
+							yPixels[iL][jP] = jY;
+							jP++;						// increment Pixel index for next one
+						}
+					}
+				}
+				break;			
+				default:
+			}	// end of Switch (smode)
+		}						// end of Constructor
+			// method nLines	_____________________
+		int nLines () {
+			return nLines;		// total number of scanLines
+		}
+			// method nPixels[]	_____________________
+		int [] nPixels() {		// number of pixels in scanLine [i]
+			return nPixels;
+		}
+			// method xPixels[][]	____________________
+		int [][] xPixels() {	// x value for xPixels [scanLine] [pixel]
+			return xPixels;
+		}
+			// method yPixels[][]	____________________
+		int [][] yPixels() {	// y value in ...
+			return yPixels;
+		}
+	}	// end of Class ScanLines
+
+	// =======================================================================================================================================	saved copy 14 Aug 2020
+	/* Class ScanLines		Supplies pixel x,y values to scan w x h field in one of 4 modes					run 6-Jul-2020
+	 * 0	h horizontal:x increments along line of constant y; horizontal, left to right
+	 * 1	v vertical: y increments along line of constant x; vertical, top to bottom
+	 * 2	dd diagonal down: both x & y increment; diagonal lines top left to bottom right
+	 * 3	du diagonal up: x increments, y decrements; diagonal lines bottom left to top right
+	 * To scan: for {each scanLine} for{pixels in scanLine; xLine[] -> x, yLine[] -> y for getPixel(x,y)
+	 * Methods return nScanLines, nPixels[] in each, xLine[ScanLine][PixelNo], yLine[ScanLine][PixelNo]
+	 * @author mwkonrad
+	 * @version 13-Aug-2020
+	*/
+	class ScanLinesOld {
+		public int w,h;											// width, height of scanned field
+		public int smode;										// scan mode; see top comment
+		private int nPixels[] = new int[3000];					// w + h for 45 deg ScanLines; max [1920][1080]
+		private int xPixels[][] = new int[3000][3000];			// [i th line][j th value in this line]
+		private int yPixels[][] = new int[3000][3000];
+		private int nLines;										//total number of Scan Lines
+		private int iL, jP, jX;		// twice w, SL index, Pixel index, value of Y, value of X
+		private int jY1;
+		private boolean startSL;								// true when valid x,y values 1st found in VSL 
+								// Constructor	_______________________
+		ScanLinesOld (int w, int h, int smode) {
+			this.w = w;
+			this.h = h;
+			this.smode = smode;
+			
+			switch (smode) {
+				case 0:	nLines = h;		// each scan line has constant Y, thus there are h = height of field
+						for (int i = 0; i < nLines; i++) {		// i th sLine
+							nPixels[i] = w;						// values in this line
+							for (int j = 0; j < w; j++) {		// 
+								xPixels[i][j] = j;
+								yPixels[i][j] = i;
+							}
+						}
+				break;
+				case 1:	nLines = w;		// each scan line has constant X, thus there are w = width of field
+						for (int i = 0; i < nLines; i++) {
+							nPixels[i] = h;
+							for (int j = 0; j < h; j++) {
+								xPixels[i][j] = i;
+								yPixels[i][j] = j;
+							}
+						}
+				break;
+				case 2:	nLines = h + w - 1;	// ScanLines = diagonals directed down & to right; 1st at LL corner
+						iL = -1;								// SL index
+						for (int iX = -h; iX < w; iX++ ) {		// iX = initial X on this VSL
+							startSL = true;
+							jP = 0;								// initialize Pixel index
+							
+							for (int jY = 0; jY < h; jY++) {	// Y values on this VSL; move down on SL
+								jX = iX + jY;					// X values moving down this VSL
+								if ((jX >= 0) && (jX < h)) {	// we are on a valid SL segment
+								
+									if (startSL) {				// this is the 1st valid point on this SL
+										iL++;					// so increment iL
+										startSL = false;		// can be 1st only once on this SL
+									}
+									nPixels[iL]++;				// one more Pixel on this VSL
+									xPixels[iL][jP] = jX;
+									yPixels[iL][jP] = jY;
+									jP++;						// increment Pixel index
+								}
+							}
+						}
+				break;			
+				case 3:	nLines = h + w - 1;	// ScanLines = diagonals directed up & to right; 1st at UL corner
+				jY1 = h - 1;							// jY1 = Y at bottom of FOV
+				iL = -1;								// SL index
+				for (int iX = -h; iX < w; iX++ ) {		// start X at LL end of diagonal (from -h,h -> 0,0)
+					startSL = true;						// for all VSL
+					jP = 0;								// for all VSL
+					
+					for (int jY = jY1; jY >= 0; jY--) {	// Y values on this VSL; move up on SL
+						jX = iX + (jY1 - jY);			// X values moving up this VSL
+						if ((jX >= 0) && (jX < w)) {	// we are on a valid SL segment
+							
+							if (startSL) {				// this is the 1st valid point on this SL
+								iL++;					// so increment iL from start of -1
+								startSL = false;		// can be 1st only once on this SL
+							}
+							nPixels[iL]++;				// one more Pixel on this VSL
+							xPixels[iL][jP] = jX;		// save X,Y in proper Pixels[][]
+							yPixels[iL][jP] = jY;
+							jP++;						// increment Pixel index for next one
+						}
+					}
+				}
+				break;			
+				default:
+			}	// end of Switch (smode)
+		}						// end of Constructor
+			// method nLines	_____________________
+		int nLines () {
+			return nLines;
+		}
+			// method nPixels[]	_____________________
+		int [] nPixels() {
+			return nPixels;
+		}
+			// method xPixels[][]	____________________
+		int [][] xPixels() {
+			return xPixels;
+		}
+			// method yPixels[][]	____________________
+		int [][] yPixels() {
+			return yPixels;
+		}
+	}	// end of Class ScanLines
+
+	
